@@ -165,7 +165,7 @@ curl.exe -H "Content-Type: application/json" -d '{"source":"disabled"}' http://l
 | `404 Not Found` | No route pattern matched the URL. |
 | `404 Not Available` | A generic route pattern matched, but the requested property or resource is not exposed by that handler/device. For example, `/monitoring/pan` matches `/monitoring/:param`, but `pan` is not an available monitoring property. |
 | 429 | Device-backed requests were issued too quickly; retry after a delay. |
-| 500 | Handler failed unexpectedly. Observed for `GET /preset` on AudioFuse Studio. |
+| 500 | Handler failed unexpectedly. Observed for `GET /preset` and when a non-numeric string is captured as an `:index` value. |
 
 `HEAD` is handled generically, but the server closes the response with the GET
 `Content-Length` and no body; some clients report this as a short transfer.
@@ -187,6 +187,14 @@ Access-Control-Allow-Methods: GET, PUT, POST, OPTIONS
 
 The precise PUT operation remains unresolved. `/version` and `/devices` do not
 have an OPTIONS route and return 404.
+
+An OPTIONS success proves that a route *pattern* matched; it does not prove that
+the concrete URL identifies a valid resource. For example, both
+`/output/analog/volume` and `/output/analog/nonsense` match
+`/output/analog/:index`, so OPTIONS returns 200 and advertises GET, PUT, POST,
+and OPTIONS. A subsequent GET returns `500 Unexpected Error` because `volume`
+or `nonsense` is not a valid numeric index. The actual volume leaf has the form
+`/output/analog/:index/volume`.
 
 ## Service endpoints
 
@@ -439,7 +447,38 @@ Example mode options for inputs 7–8:
 
 ## Outputs
 
+### Aggregates
+
+```text
+GET /output
+GET /output/analog
+GET /output/analog/:index
+```
+
+`GET /output` returned 200 with an `output` object containing the `adat`, `aux`,
+`loopback`, and `spdif` aggregates. For example, its ADAT channel 1 entry was:
+
+```json
+{"source":"usb","source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_1_2"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 1-2"]}}
+```
+
+On the tested Studio, `GET /output/analog` and the tested indexed analog
+aggregates returned `500 Unexpected Error`.
+
 ### Auxiliary outputs
+
+Collection aggregate:
+
+```http
+GET /api/v1/output/aux
+```
+
+```json
+{"aux":{"l":{"link":true,"reamp":false,"source":"main_left","source_options":{"keys":["main_left","cue_1_left","cue_2_left","adc_1","adc_2","adc_3","adc_4","daw"],"labels":["Main L","Cue 1 L","Cue 2 L","ADC 1","ADC 2","ADC 3","ADC 4","DAW"]},"volume":0.0},"r":{"link":true,"reamp":true,"source":true,"source_options":null,"volume":true}}}
+```
+
+The right-side values in this collection aggregate do not have the types
+returned by the corresponding leaf routes; use the leaves for control values.
 
 For side `l` or `r`:
 
@@ -464,6 +503,10 @@ The right side uses corresponding `*_right` keys and labels for main/cue.
 
 ### ADAT outputs
 
+`GET /output/adat` returns an aggregate containing indexes 1 through 8. In the
+observed response, indexes 1–3 had source `usb`, while indexes 4–8 had a null
+source; every index also included a keyed `source_options` object.
+
 For indexes 1 through 8:
 
 ```text
@@ -485,6 +528,7 @@ All eight channels returned source `usb`. Every options list contains `main`,
 ### S/PDIF output
 
 ```text
+GET  /output/spdif
 GET  /output/spdif/source
 GET  /output/spdif/source_options
 POST /output/spdif
@@ -503,6 +547,7 @@ Note the S/PDIF keys use `cue1`/`cue2`, unlike ADAT's `cue_1`/`cue_2`.
 ### Loopback output
 
 ```text
+GET  /output/loopback
 GET  /output/loopback/source
 GET  /output/loopback/source_options
 POST /output/loopback
@@ -525,7 +570,13 @@ Static routes exist for:
 /output/analog/:index/link
 ```
 
-On the tested Studio, indexes 1–2 returned 404 and indexes 3–4 returned 403.
+On the tested Studio, the volume leaves for indexes 1–2 returned
+`404 Not Available`, while indexes 3–4 returned `403 Device Not Found`.
+
+The placeholder consumes one complete path segment. Thus
+`/output/analog/volume` matches `/output/analog/:index` with the invalid textual
+index `volume`; it is not an alternative collection-level volume route. The
+volume leaf is `/output/analog/:index/volume`.
 
 ## Presets
 
