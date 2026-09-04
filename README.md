@@ -161,8 +161,9 @@ curl.exe -H "Content-Type: application/json" -d '{"source":"disabled"}' http://l
 | Status | Observed meaning |
 | --- | --- |
 | 200 | Successful read/write or OPTIONS request. |
-| 403 | Route exists, but the device/index does not currently expose that capability. The server may describe this as `Device Not Found`. |
-| 404 | No matching registered route. |
+| 403 | Route exists, but one or more requested properties are unavailable or invalid for the device/index. A leaf response may be empty and described as `Device Not Found`; an aggregate response may instead contain useful partial JSON with reason phrase `Invalid Request`. |
+| `404 Not Found` | No route pattern matched the URL. |
+| `404 Not Available` | A generic route pattern matched, but the requested property or resource is not exposed by that handler/device. For example, `/monitoring/pan` matches `/monitoring/:param`, but `pan` is not an available monitoring property. |
 | 429 | Device-backed requests were issued too quickly; retry after a delay. |
 | 500 | Handler failed unexpectedly. Observed for `GET /preset` on AudioFuse Studio. |
 
@@ -250,6 +251,24 @@ was not tested in this pass.
 
 ## Monitoring
 
+### Aggregate
+
+```http
+GET /api/v1/monitoring
+```
+
+Observed AudioFuse Studio response:
+
+```json
+{"monitoring":{"ab_speaker_set":false,"dim":false,"mono":false,"mute":false,"phones":{"1":{"mono":false,"source":"main_mix","source_options":["main_mix"]},"2":{"ab_speaker_set":"main_mix","mono":"main_mix","source":"main_mix","source_options":["main_mix"]}},"source":"main_mix","source_options":["main_mix"],"volume":"main_mix"}}
+```
+
+In this aggregate, `volume: "main_mix"` indicates that the physical volume
+knob is assigned to Main Mix; it is not the numeric monitor level. Read
+`GET /monitoring/volume` for that level. Other aggregate fields can likewise
+describe assignments or expose a reduced representation, so use the leaf
+routes below when the exact control value or complete option list is needed.
+
 ### Core leaves
 
 | GET route | Type | Studio result/example |
@@ -300,6 +319,34 @@ be device-dependent.
 
 ### Headphones
 
+Collection aggregate:
+
+```http
+GET /api/v1/monitoring/phones
+```
+
+```json
+{"phones":{"1":{"mono":false,"source":"main_mix","source_options":{"keys":["main_mix","cue_mix_1","cue_mix_2"],"labels":["Main Mix","Cue Mix 1","Cue Mix 2"]}},"2":{"ab_speaker_set":false,"mono":false,"source":"main_mix","source_options":["main_mix"]}}}
+```
+
+Indexed aggregates are also available:
+
+```text
+GET /monitoring/phones/1
+GET /monitoring/phones/2
+```
+
+```json
+{"1":{"mono":false,"source":"main_mix","source_options":{"keys":["main_mix","cue_mix_1","cue_mix_2"],"labels":["Main Mix","Cue Mix 1","Cue Mix 2"]}}}
+```
+
+```json
+{"2":{"ab_speaker_set":false,"mono":false,"source":"main_mix","source_options":{"keys":["main_mix","cue_mix_1","cue_mix_2"],"labels":["Main Mix","Cue Mix 1","Cue Mix 2"]}}}
+```
+
+The collection aggregate returned a reduced `source_options` array for phones
+2, while its indexed aggregate returned the complete keyed option object.
+
 For `index` 1 and 2:
 
 | GET route | Studio support |
@@ -327,6 +374,22 @@ POST /input/analog/:index
 The analog-input aggregate appears to combine current values, capability state,
 and option metadata. Use the leaf routes below when requesting an individual
 control's current value.
+
+All tested indexed aggregate requests (`GET /input/analog/1` through
+`GET /input/analog/8`) returned HTTP `403 Invalid Request` **with a valid partial
+JSON body**. For example:
+
+```http
+HTTP/1.1 403 Invalid Request
+Content-Type: application/json
+
+{"1":{"48v":null,"inst":false,"pad":"Pad","pad_options":{"keys":["off","pad","boost"],"labels":["Off","Pad","Boost"]},"phase_invert":false}}
+```
+
+The status appears to reflect at least one unavailable property in the aggregate
+(represented as `null`), while supported properties are still returned. Clients
+should parse the JSON body even when this aggregate returns 403, or query the
+individual leaf routes to obtain independent status codes.
 
 ### Inputs 1–4
 
@@ -503,6 +566,53 @@ value. The unusual boolean and null fields seen in `/input/analog` may likewise
 encode availability or control state; their precise semantics remain under
 investigation and should not currently be described as conversion corruption.
 
+## Main Mix and Cue Mix controls missing from HTTP
+
+The `/monitoring` routes cover the monitor-controller functions, not the mixer
+shown on AFCC's Main Mix, Cue Mix 1, and Cue Mix 2 pages. AudioFuse Control
+Center exposes that mixer internally, but the stock HTTP plugin in this AFCC
+release does not expose its controls as HTTP routes.
+
+The omitted subsystem includes, for every mix:
+
+- Analog inputs 1–8: level, pan, mute, solo and stereo-pair state.
+- S/PDIF inputs 1–2: level, pan, mute, solo and stereo-pair state.
+- ADAT inputs 1–8: level, pan, mute, solo and stereo-pair state.
+- USB inputs 1–6: level, pan, mute, solo and stereo-pair state.
+- Mixer output level and related mixer state.
+
+AFCC also has local-only mixer metadata such as channel name, visibility,
+grouping, peak meters, and the currently selected mixer. Not every internal
+parameter is sent to the device.
+
+Static inspection of the Studio parameter definition identifies, for example,
+these pan controls:
+
+| Mix | USB input 1 pan parameter | Normalized values |
+| --- | ---: | --- |
+| Main Mix | 425 | `0.0` hard left, `0.5` center, `1.0` hard right |
+| Cue Mix 1 | 633 | `0.0` hard left, `0.5` center, `1.0` hard right |
+| Cue Mix 2 | 841 | `0.0` hard left, `0.5` center, `1.0` hard right |
+
+The Main Mix parameter is named `Mixer 1 USB 1 Pan`. AFCC maps it to its
+internal `iMAINMIXPANCHANNEL` device control. Thus the requested operation
+"USB input 1, 100% right in Main Mix" is internally parameter 425 with normalized
+value `1.0`.
+
+Likewise, Main Mix Analog Input 6 mute is internal parameter 326 (`0` off,
+`1` on); the corresponding Cue Mix parameters are 534 and 742.
+
+However, `httpfuse.dll` contains no registered `/mixer`, `/input/usb`, mixer
+level, `pan`, `balance`, mixer `mute`, or mixer `solo` property implementation.
+Runtime requests distinguish two cases: `/mixer` and `/input/usb/1/pan`
+returned `404 Not Found`, while `/monitoring/pan` and `/monitoring/balance`
+matched the generic `/monitoring/:param` pattern but returned
+`404 Not Available`. Consequently
+there is currently no evidence-backed `curl` request for these operations
+through the stock HTTP API. AFCC performs them through its separate internal
+IPC/device-control path; reverse-engineering that transport is a distinct open
+task.
+
 ## Open questions
 
 - Exact PUT routes and request bodies, especially preset operations.
@@ -511,3 +621,5 @@ investigation and should not currently be described as conversion corruption.
 - Exact SSE update semantics and heartbeat interval.
 - Authentication, binding/interface exposure, and cross-origin security model.
 - Capability differences across other AudioFuse models.
+- Message format for AFCC's internal IPC/device-control path, needed for mixer
+  level, mute, solo, pan, and balance controls absent from the HTTP plugin.
