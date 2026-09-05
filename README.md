@@ -38,8 +38,8 @@ GET /api/v1/monitoring/mute
 {"mute":false}
 ```
 
-Setters use POST with a partial JSON object sent to the parent resource, not to
-the leaf URL:
+Ordinary setters use POST with a partial JSON object sent to the parent
+resource:
 
 ```http
 POST /api/v1/monitoring
@@ -69,8 +69,8 @@ knob. Prefer leaf GETs when requesting a control's current value.
 
 ## Setting values
 
-There is no `/set` endpoint. Do not POST to the leaf GET route. Send a partial
-object to the leaf's parent resource:
+There is no `/set` endpoint. For ordinary properties, send a partial object to
+the leaf's parent resource:
 
 ```text
 GET  /api/v1/monitoring/mute
@@ -140,6 +140,13 @@ The remaining rows follow setter registrations recovered statically but have not
 all been exercised on hardware. Option lists and state-only fields such as
 `current_source`, `sync`, and `*_options` are read-only.
 
+The plugin also registers specialized POST routes directly on several numeric
+leaves. They are included in the static method matrix below. On the tested
+Studio, posting an unchanged object value to `/monitoring/volume`,
+`/input/analog/5/gain`, and `/output/aux/l/volume` returned
+`404 Not Available`; their intended body format or device scope remains
+unresolved.
+
 ### Complete command examples
 
 ```powershell
@@ -196,6 +203,55 @@ and OPTIONS. A subsequent GET returns `500 Unexpected Error` because `volume`
 or `nonsense` is not a valid numeric index. The actual volume leaf has the form
 `/output/analog/:index/volume`.
 
+### Complete statically registered method matrix
+
+This matrix comes from all 82 calls to the route-registration function in
+`httpfuse.dll`. Routes are included even when unavailable on the tested Studio,
+because another AudioFuse model or configuration may implement them.
+
+| Route pattern | Registered methods |
+| --- | --- |
+| `/devices` | GET |
+| `/version` | GET |
+| `/update` | POST, OPTIONS |
+| `/monitoring` | GET, PUT, POST, OPTIONS |
+| `/monitoring/:param` | GET |
+| `/monitoring/volume` | POST, OPTIONS |
+| `/monitoring/phones` | GET, POST, OPTIONS |
+| `/monitoring/phones/:index` | GET, PUT, POST, OPTIONS |
+| `/monitoring/phones/:index/:param` | GET |
+| `/monitoring/phones/:index/volume` | POST |
+| `/clock` | GET, PUT, POST, OPTIONS |
+| `/clock/:param` | GET |
+| `/preset` | GET, PUT, POST, OPTIONS |
+| `/preset/:param` | GET |
+| `/output` | GET, POST, OPTIONS |
+| `/output/analog` | GET, POST, OPTIONS |
+| `/output/analog/:index` | GET, PUT, POST, OPTIONS |
+| `/output/analog/:index/:param` | GET |
+| `/output/analog/:index/volume` | POST |
+| `/output/aux` | GET, POST, OPTIONS |
+| `/output/aux/:side` | GET, PUT, POST, OPTIONS |
+| `/output/aux/:side/:param` | GET |
+| `/output/aux/:side/volume` | POST |
+| `/output/adat` | GET, POST, OPTIONS |
+| `/output/adat/:index` | GET, PUT, POST, OPTIONS |
+| `/output/adat/:index/:param` | GET |
+| `/output/spdif` | GET, PUT, POST, OPTIONS |
+| `/output/spdif/:param` | GET |
+| `/output/loopback` | GET, PUT, POST, OPTIONS |
+| `/output/loopback/:param` | GET |
+| `/input` | GET, POST, OPTIONS |
+| `/input/analog` | GET, POST, OPTIONS |
+| `/input/analog/:index` | GET, PUT, POST, OPTIONS |
+| `/input/analog/:index/:param` | GET |
+| `/input/analog/:index/gain` | POST, OPTIONS |
+
+The registration operation identifiers `0`, `1`, `2`, and `4` map to GET, PUT,
+POST, and OPTIONS. Registration does not prove device support: a handler can
+still return `403 Device Not Found`, `404 Not Available`, or
+`500 Unexpected Error`.
+
 ## Service endpoints
 
 ### Devices
@@ -211,6 +267,21 @@ GET /api/v1/devices
 Each string in `devices` is the serial number of a connected AudioFuse device.
 The serial number is not exposed as a REST subresource:
 `GET /devices/<device-serial-number>` returned 404.
+
+### Update submission
+
+Static registration confirms:
+
+```text
+POST    /api/v1/update
+OPTIONS /api/v1/update
+```
+
+OPTIONS returned 200 and advertised `GET, POST, OPTIONS`, although no GET
+handler is registered and `GET /update` returned `404 Not Found`. The POST body
+schema and intended caller remain unknown, so it has not been invoked. The
+string `/update/endpoints` also occurs in the DLL, but it is not registered as
+an HTTP route; `GET /update/endpoints` returned `404 Not Found`.
 
 ### Events
 
@@ -322,8 +393,8 @@ Static analysis also confirms this immersive solo/mute subgroup:
 /monitoring/mute_lfe
 ```
 
-It has not yet been exhaustively runtime-probed in this pass and is expected to
-be device-dependent.
+All twelve leaves returned `403 Device Not Found` on the tested Studio. They
+are registered by the plugin but unsupported by this device/configuration.
 
 ### Headphones
 
@@ -382,6 +453,22 @@ POST /input/analog/:index
 The analog-input aggregate appears to combine current values, capability state,
 and option metadata. Use the leaf routes below when requesting an individual
 control's current value.
+
+Both collection aggregates returned `500 Unexpected Error` **with usable JSON
+bodies**. The bodies differ only in their outer wrapper:
+
+```http
+GET /api/v1/input
+HTTP/1.1 500 Unexpected Error
+Content-Type: application/json
+```
+
+```json
+{"input":{"analog":{"1":{"48v":null,"inst":false,"pad":"Pad","pad_options":{"keys":["off","pad","boost"],"labels":["Off","Pad","Boost"]},"phase_invert":false},"2":{"48v":false,"inst":false,"pad":false,"pad_options":null,"phase_invert":false},"3":{"48v":false,"inst":false,"pad":false,"pad_options":null,"phase_invert":false},"4":{"48v":false,"inst":false,"pad":false,"pad_options":null,"phase_invert":false},"5":{"gain":false,"link":false,"mode":false,"mode_options":null,"pad":false,"pad_options":null},"6":{"gain":false,"link":false,"mode":false,"mode_options":null,"pad":false,"pad_options":null},"7":{"gain":false,"link":false,"mode":false,"mode_options":null,"pad":false,"pad_options":null},"8":{"gain":false,"link":false,"mode":false,"mode_options":null,"pad":false,"pad_options":null}}}}
+```
+
+`GET /api/v1/input/analog` returned the same `analog` object directly beneath
+the root instead of beneath `input`.
 
 All tested indexed aggregate requests (`GET /input/analog/1` through
 `GET /input/analog/8`) returned HTTP `403 Invalid Request` **with a valid partial
@@ -456,11 +543,15 @@ GET /output/analog/:index
 ```
 
 `GET /output` returned 200 with an `output` object containing the `adat`, `aux`,
-`loopback`, and `spdif` aggregates. For example, its ADAT channel 1 entry was:
+`loopback`, and `spdif` aggregates:
 
 ```json
-{"source":"usb","source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_1_2"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 1-2"]}}
+{"output":{"adat":{"1":{"source":"usb","source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_1_2"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 1-2"]}},"2":{"source":"usb","source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_1_2"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 1-2"]}},"3":{"source":"usb","source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_3_4"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 3-4"]}},"4":{"source":null,"source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_3_4"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 3-4"]}},"5":{"source":null,"source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_3_4"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 3-4"]}},"6":{"source":null,"source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_3_4"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 3-4"]}},"7":{"source":null,"source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_3_4"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 3-4"]}},"8":{"source":null,"source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_3_4"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 3-4"]}}},"aux":{"l":{"link":null,"reamp":null,"source":null,"source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_3_4"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 3-4"]},"volume":null},"r":{"link":null,"reamp":null,"source":null,"source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_3_4"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 3-4"]},"volume":null}},"loopback":{"source":null,"source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_3_4"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 3-4"]}},"spdif":{"source":null,"source_options":{"keys":["main","cue_1","cue_2","usb","adat_in_3_4"],"labels":["Main","Cue 1","Cue 2","USB","ADAT IN 3-4"]}}}}
 ```
+
+As with other top-level aggregates, several nested values and option lists are
+`null` or differ from the corresponding child responses. Query the child or
+leaf route when its precise current value is required.
 
 On the tested Studio, `GET /output/analog` and the tested indexed analog
 aggregates returned `500 Unexpected Error`.
@@ -655,6 +746,11 @@ Likewise, Main Mix Analog Input 6 mute is internal parameter 326 (`0` off,
 
 However, `httpfuse.dll` contains no registered `/mixer`, `/input/usb`, mixer
 level, `pan`, `balance`, mixer `mute`, or mixer `solo` property implementation.
+The address-aware disassembly contains exactly 82 calls to the endpoint
+registration function at `0x18000c280`. All 82 occur in the service-constructor
+block and load literal route strings; no second or dynamically constructed
+route-registration path was found.
+
 Runtime requests distinguish two cases: `/mixer` and `/input/usb/1/pan`
 returned `404 Not Found`, while `/monitoring/pan` and `/monitoring/balance`
 matched the generic `/monitoring/:param` pattern but returned
