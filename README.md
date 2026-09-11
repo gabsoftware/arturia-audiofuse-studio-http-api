@@ -16,13 +16,35 @@ with an AudioFuse Studio.
 Device capability varies by model, input/output index, power state, and
 possibly firmware.
 
+The API requires the **latest firmware** on the device and the **latest
+AFCC** on the host — it ships **disabled by default**; the user must
+explicitly turn it on once via **Preferences → Http Api → Server: On**.
+That setting persists across host reboots once set. If discovery finds
+nothing, the most common cause is simply that the toggle was never flipped.
+
+The current API version is `v1` (the `/api/v1` prefix). Non-breaking
+additions (new endpoints, new fields) may appear under `/api/v1` without a
+version bump — a client should ignore unknown fields rather than treat them
+as errors. A future breaking change would move to `/api/v2`.
+
 ## Base URL
 
 ```text
 http://localhost:64347/api/v1
 ```
 
-The listener belongs to `AudioFuseControlCenterAgent.exe`. API version discovery:
+The port above (`64347`) was observed in one session against a tested Studio
+— it is **not stable**. The listener belongs to
+`AudioFuseControlCenterAgent.exe`, the AFCC background agent — the API keeps
+running even when the AFCC UI window is closed, since it's hosted by the
+agent process, not the UI. The port can be dynamically re-allocated if the
+requested one is taken, is not exposed in any user-editable config file, and
+is not guaranteed stable across agent restarts. Production clients must
+resolve it via Bonjour/DNS-SD rather than hardcoding a port (see
+[Discovery](#discovery) below); the hardcoded value here is only for the
+one-off manual `curl` examples throughout this document.
+
+API version discovery:
 
 ```http
 GET /api/v1/version
@@ -31,6 +53,45 @@ GET /api/v1/version
 ```json
 {"version":"1.0.0"}
 ```
+
+## Discovery
+
+The service is advertised over Bonjour/DNS-SD as `_audiofusehttp._tcp.` in
+domain `local.`, TCP transport. TXT records are not used in this release —
+don't depend on them. The advertised record's `addresses` array **may
+include the host's LAN IP**; the HTTP server itself binds only to
+`127.0.0.1`, so always connect to `http://127.0.0.1:<port>` — connecting to
+the LAN address fails. If a resolved record's addresses don't match any
+local interface, treat it as another host's advertisement on the same LAN
+and ignore it (the reference plugin filters this way; the sample scripts in
+`user documentation/samples/` implement the same filter).
+
+```bash
+# macOS
+dns-sd -B _audiofusehttp._tcp.
+dns-sd -L "AudioFuse Http Api" _audiofusehttp._tcp. local
+
+# Linux (Avahi)
+avahi-browse -r _audiofusehttp._tcp.
+```
+
+Python (`zeroconf`) and Node (`bonjour-service`) libraries work the same
+way — browse for the service type, take the port, ignore the host. See
+[`03-discovery-and-connection.md`](./user%20documentation/03-discovery-and-connection.md)
+for full listings in both.
+
+A robust client cycles through **DISCOVERING → CONNECTING → READY →
+RECONNECTING**: discover the port, confirm with `GET /version` (and
+`GET /devices`), then issue normal requests; on a Bonjour `down` event or an
+SSE error, close everything and go back to DISCOVERING after a 1–2s backoff.
+Doing the version/devices check up front (rather than inferring server
+health from the first parameter request's `403`) gives a much clearer error
+message to surface to the user ("AFCC is running but no AudioFuse is
+connected" vs. an opaque failure).
+
+If Bonjour is unavailable (blocked mDNS on a hardened network), fall back to
+asking the user to paste the port shown in Control Center's preferences —
+this is a last-resort escape hatch, not the primary path.
 
 ## General conventions
 
@@ -75,6 +136,29 @@ always have the same meaning as the similarly named leaf. For example,
 `/monitoring/volume` returns the numeric level currently controlled by that
 knob. Prefer leaf GETs when requesting a control's current value.
 
+Per the official spec, a successful `PUT`/`POST` returns `200 OK` with an
+**empty body** (or `200 Request ignored` with a short note if the write was
+a no-op). The examples in this document that show a setter echoing the
+field back (e.g. `POST /monitoring {"mute":false}` → `{"mute":false}`) are
+what was actually observed at runtime against the tested Studio — a real
+discrepancy from the documented empty-body contract, not a typo. Don't rely
+on the echoed value in a client; always treat a bare `200` as success and
+re-`GET` if you need the confirmed value.
+
+Values are typed per the general JSON conventions: booleans are lowercase
+and unquoted (`true`/`false`), integers have no decimal point, floats used
+for level/gain controls are always in dB, strings are used for enum keys
+(never labels), and `{"endpoints": [...]}`-style arrays and `{"1": {...}}`-
+style keyed objects are used for subscriptions and indexed collections
+respectively. A type mismatch (e.g. `"true"` instead of `true`) is rejected
+with `400 Invalid Value Type`.
+
+Most parent endpoints accept **any combination** of their children in a
+single `POST`; `/preset`'s `name`/`slot`/`saved` combination rules (see
+[Presets](#presets)) and a few per-channel link constraints are the
+documented exceptions, rejected with `403 Invalid Request` because the
+combination would be semantically ambiguous or unsafe.
+
 ## Setting values
 
 There is no `/set` endpoint. For ordinary properties, send a partial object to
@@ -88,8 +172,22 @@ GET  /api/v1/input/analog/1/inst
 POST /api/v1/input/analog/1   {"inst": false}
 ```
 
-Include `Content-Type: application/json`. A successful setter returns the field
-that was applied, for example `{"mute":true}`.
+`Content-Type: application/json` is required whenever the request has a
+body (optional but recommended otherwise); if present, it must be exactly
+`application/json` or the server rejects it with `400 Invalid Content Type`.
+
+**PUT vs POST**: `PUT` sets exactly one field — either on a leaf endpoint
+(`PUT /monitoring/mute {"mute": true}`) or on a parent endpoint with a single
+child (`PUT /monitoring {"mute": true}`, equivalent to the leaf form). `POST`
+sets multiple fields on a parent endpoint in one round trip
+(`POST /monitoring {"mute": false, "volume": -3.5, "dim": false}`). Both have
+the same effect when only one field is being set; use `PUT` for simple
+single-field changes (the URL is self-describing and easy to log) and `POST`
+for atomic-feeling multi-parameter updates like scene/snapshot recall. Either
+method rejects a write to a read-only endpoint with
+`405 Read-Only Resource` — this covers every `*_options` endpoint, plus
+`current_source`, `sync`, `is_at_reference_level`, `preset/names`,
+`version`, `devices`, and `update/endpoints`.
 
 For PowerShell with `curl.exe`, put the JSON body in single quotes:
 
@@ -173,25 +271,50 @@ curl.exe -H "Content-Type: application/json" -d '{"source":"disabled"}' http://l
 
 ### Status codes
 
-| Status | Observed meaning |
-| --- | --- |
-| 200 | Successful read/write or OPTIONS request. |
-| 403 | Route exists, but one or more requested properties are unavailable or invalid for the device/index. A leaf response may be empty and described as `Device Not Found`; an aggregate response may instead contain useful partial JSON with reason phrase `Invalid Request`. |
-| `404 Not Found` | No route pattern matched the URL. |
-| `404 Not Available` | A generic route pattern matched, but the requested property or resource is not exposed by that handler/device. For example, `/monitoring/pan` matches `/monitoring/:param`, but `pan` is not an available monitoring property. |
-| 429 | Device-backed requests were issued too quickly; retry after a delay. |
-| 500 | Handler failed unexpectedly. Observed for `GET /preset` and when a non-numeric string is captured as an `:index` value. |
+| Status | Meaning | Retry? |
+| --- | --- | --- |
+| `200 OK` | Successful read/write or OPTIONS request. | n/a |
+| `200 Request ignored` | Write accepted but was a no-op (value already matched, or documented no-op like `PUT /preset {"saved": false}`). Treat as success; suppress a "value changed" toast if you have one. | n/a |
+| `400 Invalid Content Type` | The `Content-Type` header was present but not `application/json`. | No — client bug. |
+| `400 Empty Request Body` | `PUT`/`POST` sent with no body on an endpoint that requires one. | No. |
+| `400 Request Body Parsing Failed` | Body was not valid JSON (unquoted keys, trailing commas, etc). | No. |
+| `400 Invalid Value` | A value was outside the legal range (e.g. `slot: 99`, an unsupported `sample_rate`). | No — validate against `*_options` first. |
+| `400 Invalid Value Type` | The JSON type didn't match the endpoint's type (e.g. `"true"` instead of `true`). | No. |
+| `403 Device Not Found` | No AudioFuse connected at all, or `targeted-device` names a serial that no longer matches. | Yes — refresh `/devices` first, 500ms then exponential to ~5s. |
+| `403 Invalid Device` | The connected device's model doesn't support the API at all (anything but 16Rig/Studio). | No — nothing to retry, surface to user. |
+| `403 Invalid Request` | Syntactically valid but semantically rejected: forbidden field combination (e.g. `/preset` `name`+`slot`), a channel that can't be split/joined, or a device-state conflict (e.g. 48V with nothing plugged in). | No — fix the request shape. |
+| `404 Not Found` | No route pattern matched the URL. | No. |
+| `404 Not Available` | A route pattern matched, but the property/resource isn't exposed by this device or index. | No. |
+| `405 Read-Only Resource` | A write was sent to a read-only endpoint. Covers every `*_options` endpoint plus `current_source`, `sync`, `is_at_reference_level`, `preset/names`, `version`, `devices`, and `update/endpoints`. | No. |
+| `429 Too many requests` | The firmware rate-limits writes to give the device time to physically apply each change (relay switching, PLL re-lock) before the next arrives. | Yes, but slow down — coalesce rapid writes (e.g. a scrubbing slider), ≥200ms between writes. |
+| `500 Unexpected Error` | Handler failed unexpectedly — usually a hardware/driver fault (`/clock/preferred_source` losing track of the device is the most common trigger) rather than a client bug. Also observed for `GET /preset` on Studio and a non-numeric string captured as an `:index`. | At most once or twice (1s, then 3s), then surface and suggest reconnecting the device or restarting AFCC. |
 
-`403 Device Not Found` is reserved for "no AudioFuse connected at all"
-(including a `targeted-device` header naming a serial that no longer
-matches). An unsupported parameter/index on a device that *is* connected
-should return `404 Not Available` instead — some responses recorded in this
-document for unsupported params on the tested Studio used `403` where `404`
-was expected; treat `404 Not Available` as the correct behavior per the
-[error code reference](./user%20documentation/07-error-codes.md#403-device-not-found).
+Some responses recorded in this document for unsupported params on the
+tested Studio used `403 Device Not Found` where the spec calls for
+`404 Not Available` — see the table above and treat `404` as the documented
+behavior for "endpoint exists but unsupported on this device/index," and
+`403 Device Not Found` strictly for "no device connected at all."
+
+The 429 numbers above are conservative; the sample scripts in
+`user documentation/samples/curl/_lib.sh` report, measured on a 16Rig, that
+a **preset recall alone keeps the API busy for ~8s**, while sample-rate
+changes and speaker-set switches are faster but still often well over 1s —
+size your retry/backoff budget accordingly (the samples default to 500ms
+between retries, up to 20 attempts, giving ~10s of headroom).
 
 `HEAD` is handled generically, but the server closes the response with the GET
 `Content-Length` and no body; some clients report this as a short transfer.
+
+### Security model
+
+The API is **localhost-only with no authentication**: it binds exclusively
+to `127.0.0.1` and is unreachable from other machines, but any process on
+the host that can reach `127.0.0.1` can read and write the full device
+state — there is no token, password, or origin check. CORS is fully open by
+design (not merely an artifact of the observed headers below), so any web
+page open in any browser on the same machine can call the API too. This is
+intentional for the current release: the API is meant as a local developer
+control surface, not an internet-facing service.
 
 ### OPTIONS and CORS
 
@@ -208,8 +331,11 @@ Some aggregate resources (`/monitoring`, `/clock`, and `/preset`) instead report
 Access-Control-Allow-Methods: GET, PUT, POST, OPTIONS
 ```
 
-The precise PUT operation remains unresolved. `/version` and `/devices` do not
-have an OPTIONS route and return 404.
+The `GET, POST, OPTIONS` list marks single-child leaves that only accept the
+multi-field `POST` form; the `GET, PUT, POST, OPTIONS` list marks parent/leaf
+resources that also accept the single-field `PUT` form (see PUT vs POST
+above). `/version` and `/devices` do not have an OPTIONS route and return
+404.
 
 An OPTIONS success proves that a route *pattern* matched; it does not prove that
 the concrete URL identifies a valid resource. For example, both
@@ -297,9 +423,13 @@ Accept: text/event-stream
 a stream opened without first subscribing stays open but never emits
 anything beyond the heartbeat. Build the subscription with `POST /update`
 before opening `/events`; `GET /update/endpoints` lists what's currently
-subscribed. The subscription is stateful and tied to the AFCC process (not
-the TCP connection), and expires after ~50s of inactivity, so refresh it
-(re-POST the same or a superset list) every 30–45s.
+subscribed. The subscription is stateful and tied to the **AFCC process,
+not the TCP connection**: if the SSE connection drops and you reconnect,
+your subscription is still in force as long as you kept refreshing it — you
+don't strictly need to re-POST on reconnect, though doing so defensively is
+cheap and covers the case where AFCC itself was restarted while you were
+disconnected. It expires after ~50s of inactivity, so refresh it (re-POST
+the same or a superset list) every 30–45s.
 
 Once subscribed, a change produces:
 
@@ -308,14 +438,36 @@ event: update
 data: {"payload":[{"key":"/monitoring/mute","value":true}]}
 ```
 
-`payload` is always an array of `{key, value}` pairs; `key` is the canonical
-path without the `/api/v1` prefix. With nothing subscribed, the stream only
-shows the heartbeat:
+`payload` is always an array of `{key, value}` pairs — never a single bare
+object, even for one change — and `key` is the canonical path without the
+`/api/v1` prefix. With nothing subscribed, the stream only shows the
+heartbeat (a detail the official docs don't mention at all — this heartbeat
+framing is purely a runtime observation from this project, not part of the
+published spec):
 
 ```text
 event: update
 : heartbeat
 ```
+
+Treat unknown `key`s or a future event type other than `update` as
+forward-compatible noise to ignore, not an error — the server may add
+lifecycle/housekeeping event types in later versions.
+
+**Common integration pitfalls**, most concretely: browser `EventSource`
+fires the default `onmessage` handler only for *unnamed* SSE events, but
+this API sends everything as a **named** `update` event — a client must use
+`addEventListener("update", ...)`, not `onmessage`, or it will silently see
+nothing. Beyond that: forgetting to subscribe before opening the stream
+(symptom: silence, not an error), letting the subscription lapse past ~50s,
+and reconnecting in a tight loop instead of backing off ≥1s (2s is the
+reference plugin's choice) are the other common mistakes.
+
+Keep **one shared SSE connection per process**, not one per UI component —
+maintain a listener registry keyed by endpoint path so multiple parts of a
+client can subscribe to the same key without opening duplicate connections.
+Multiple SSE connections from the same client multiply the server's
+bookkeeping for no benefit.
 
 ## Clock
 
@@ -343,6 +495,23 @@ GET /api/v1/clock
 Static route registration and prior runtime tests establish POST partial-object
 setters on `/clock`. Changing sample rate or clock source can disrupt audio and
 was not tested in this pass.
+
+`/clock/sample_rate`, `/clock/current_source`, `/clock/preferred_source`,
+and `/clock/sync` are all SSE-subscribable; `sample_rate_options` and
+`source_options` are static enumerations and are not. When changing
+`preferred_source`, watch `current_source` and `sync` over SSE rather than
+assuming an immediate lock — the device may take a moment, and may fall
+back to `internal` if the requested source isn't actually present.
+
+**Schema note**: the official reference's example for `*_options` uses the
+field name `values` and native JSON numbers for sample rates
+(`{"keys": [44100, 48000, ...], "values": [...]}`), while the runtime
+response actually observed against the tested Studio uses `labels` and
+string-typed keys (`{"keys": ["44100", "48000", ...], "labels": [...]}`, as
+shown above). Both the field name and the number-vs-string typing differ —
+write parsing code that tolerates either shape, and always read
+`sample_rate_options`/`source_options` at runtime rather than hardcoding
+values, since valid rates/sources can vary by firmware and product variant.
 
 ## Monitoring
 
@@ -382,35 +551,55 @@ Example source options:
 {"source_options":{"keys":["main_mix","cue_mix_1","cue_mix_2"],"labels":["Main Mix","Cue Mix 1","Cue Mix 2"]}}
 ```
 
-The following registered monitoring leaves returned 403 on AudioFuse Studio:
+`ab_speaker_set` is a plain binary A/B toggle, not a general speaker-set
+selector — the API doesn't support more than two speaker sets natively. For
+a "Mains → Mids → NS10s → Atmos array" style rig with more than two sets,
+drive the actual routing from your client or the DAW and use
+`ab_speaker_set` only as a sub-toggle within whichever pair is active.
 
-```text
-/monitoring/reference_level
-/monitoring/is_at_reference_level
-/monitoring/bass_management
-/monitoring/lip_sync
-/monitoring/lfe_10db
+The following registered monitoring leaves are **16Rig-only** and returned
+403 on the tested Studio (correct behavior — they simply don't exist on
+that device):
+
+| Endpoint | Purpose |
+| --- | --- |
+| `/monitoring/reference_level` | The reference level (dB) used by the reference-recall pattern below. RW. |
+| `/monitoring/is_at_reference_level` | `true` when the current volume equals `reference_level`. RO — the device sets this, clients can't. |
+| `/monitoring/bass_management` | Enables bass-management for the immersive bus. |
+| `/monitoring/lip_sync` | A/V sync compensation. |
+| `/monitoring/lfe_10db` | LFE channel +10dB boost. |
+
+`reference_level` + `is_at_reference_level` implement a specific workflow:
+set the reference level once at calibration time, then a single "A/B
+against reference" button just writes that same value to `/monitoring/volume`,
+and a UI indicator subscribed to `is_at_reference_level` shows whether
+you're currently sitting at it:
+
+```bash
+# Calibrate once
+curl -X PUT http://127.0.0.1:56894/api/v1/monitoring/reference_level \
+     -H 'Content-Type: application/json' -d '{"reference_level": -18.0}'
+# A/B button: jump to reference
+curl -X PUT http://127.0.0.1:56894/api/v1/monitoring/volume \
+     -H 'Content-Type: application/json' -d '{"volume": -18.0}'
 ```
 
-Static analysis also confirms this immersive solo/mute subgroup:
+Static analysis also confirms this immersive solo/mute subgroup, **16Rig-only**:
 
-```text
-/monitoring/solo_fronts
-/monitoring/mute_fronts
-/monitoring/solo_left_right
-/monitoring/mute_left_right
-/monitoring/solo_center
-/monitoring/mute_center
-/monitoring/solo_surrounds
-/monitoring/mute_surrounds
-/monitoring/solo_heights
-/monitoring/mute_heights
-/monitoring/solo_lfe
-/monitoring/mute_lfe
-```
+| Endpoint | Purpose |
+| --- | --- |
+| `/monitoring/solo_fronts` / `mute_fronts` | Solo/mute the front bed. |
+| `/monitoring/solo_left_right` / `mute_left_right` | Solo/mute L/R only. |
+| `/monitoring/solo_center` / `mute_center` | Solo/mute the centre channel. |
+| `/monitoring/solo_surrounds` / `mute_surrounds` | Solo/mute surround channels. |
+| `/monitoring/solo_heights` / `mute_heights` | Solo/mute height channels. |
+| `/monitoring/solo_lfe` / `mute_lfe` | Solo/mute the LFE channel. |
 
-All twelve leaves returned `403 Device Not Found` on the tested Studio. They
-are registered by the plugin but unsupported by this device/configuration.
+All twelve leaves returned `403 Device Not Found` on the tested Studio (per
+the 403-vs-404 caveat above, `404 Not Available` is the documented status
+for this case). These fields are mutually independent on the API — if a UI
+wants to enforce "only one solo active at a time," it must clear the others
+itself in the same `POST /monitoring` body; the device won't do it for you.
 
 ### Headphones
 
@@ -451,6 +640,12 @@ For `index` 1 and 2:
 | `/monitoring/phones/:index/source_options` | Both indexes; keyed options (`main_mix`, `cue_mix_1`, `cue_mix_2`). |
 | `/monitoring/phones/:index/volume` | 404 on both indexes. |
 | `/monitoring/phones/2/ab_speaker_set` | Supported; boolean. |
+
+`ab_speaker_set` on phones is documented as **index 2 only** — `GET/PUT
+/monitoring/phones/1/ab_speaker_set` returns `404 Not Available` by design,
+not because of a Studio-specific quirk; index 1 simply doesn't have this
+field. This matches what was observed here (only phones/2 was tested with
+it), but is worth stating as a hard rule rather than an incidental finding.
 
 Writes use `POST /monitoring/phones/:index` with the selected property in the
 JSON object.
@@ -521,7 +716,13 @@ Pad options example:
 ```
 
 The 48V results may depend on device power/capability state and should not be
-generalized to every Studio configuration.
+generalized to every Studio configuration. More generally, the official
+docs confirm several of these writes are gated on **physical connector
+presence**, independent of index-range support: 48V phantom requires an XLR
+actually plugged into that input, instrument mode requires a jack plugged
+in, and pad/phase-invert require a connector present at all — the device
+rejects the write with `403 Invalid Request` if nothing is plugged in, on
+top of (and distinct from) the capability-gating 403/404 responses above.
 
 ### Inputs 5–8
 
@@ -679,6 +880,10 @@ Static routes exist for:
 
 On the tested Studio, the volume leaves for indexes 1–2 returned
 `404 Not Available`, while indexes 3–4 returned `403 Device Not Found`.
+This matches the documented rule for 16Rig: outputs 1 and 2 are the main
+monitor outputs and are governed by `/monitoring/volume`, not a per-channel
+endpoint — only indexes 3–10 have their own `/output/analog/:index/volume`
+and `/output/analog/:index/link`.
 
 The placeholder consumes one complete path segment. Thus
 `/output/analog/volume` matches `/output/analog/:index` with the invalid textual
@@ -698,8 +903,21 @@ Static analysis confirms these route names:
 ```
 
 All tested preset leaf GETs returned 403, and aggregate `GET /preset` returned
-500 on AudioFuse Studio. The aggregate advertises GET, PUT, POST, and OPTIONS.
-The meaning and request body of PUT, plus `/preset/save_to`, remain unresolved.
+500 on AudioFuse Studio — `/preset` is 16Rig-only, so both are the expected
+behavior of testing it against a Studio.
+
+The `PUT`/`POST` semantics on the aggregate are documented: `PUT /preset
+{"name": "new name"}` renames the loaded preset; `PUT /preset {"saved":
+true}` saves in-RAM edits to the loaded slot; `POST /preset {"slot": 5,
+"saved": true}` is "save current state to slot 5" (writes and loads that
+slot); `PUT /preset {"saved": false}` is always a no-op
+(`200 Request ignored`, since the device — not the client — is the only
+thing that can clear the saved flag). Combining `name` with `slot` or
+`saved` in the same request is rejected with `403 Invalid Request`; rename
+must be its own atomic call. `/preset/save_to` remains unresolved — it
+appears only as a route string and does not match any documented behavior
+in the official reference, which describes the "save to slot" idiom above
+using the plain `/preset` endpoint instead.
 
 ## Aggregate and leaf semantics
 
@@ -776,6 +994,34 @@ through the stock HTTP API. AFCC performs them through its separate internal
 IPC/device-control path; reverse-engineering that transport is a distinct open
 task.
 
+## Evidence from the official Postman collection not matched by any doc
+
+`user documentation/audiofuse-http_api.postman_collection.json` contains
+several request shapes that appear in **neither** the official markdown
+docs nor this document's own runtime testing. They look like remnants of a
+different API generation, in-progress work, or fields later renamed —
+treat them as unverified, not as documented behavior:
+
+- `GET /clock/clock_source` and `GET /clock/preferred_clock`, and a
+  `PUT /clock {"preferred_clock": "internal", "sample_rate": 44100}` body —
+  using `clock_source`/`preferred_clock` instead of the documented
+  `current_source`/`preferred_source`. Possibly an older field-naming
+  scheme from before the current spec.
+- `GET /monitoring/reference` — distinct from the documented
+  `reference_level`/`is_at_reference_level` pair; unclear if it's a synonym,
+  a predecessor, or an unrelated field.
+- A preset `{"store": {"id": 3, "name": "test"}}` POST body, under requests
+  named "Save To + Rename" — a shape not mentioned anywhere in the official
+  `/preset` combination rules, which instead describe `{"slot": N, "saved":
+  true}` for "save to slot." This may be what `/preset/save_to` (see above)
+  was originally meant to accept.
+- `{"increment_by": -5.0}` POST bodies on what look like gain-style leaves —
+  i.e. relative-change semantics. This directly contradicts the documented
+  (and reinforced-by-recipes) rule that the API has **no** increment
+  semantics and clients must always compute and send absolute values. If
+  real, it would be a valuable shortcut; until confirmed against a live
+  device, assume it doesn't work and use read-then-write instead.
+
 ## Multi-device targeting
 
 A single AFCC instance manages every connected AudioFuse, so there is one
@@ -791,19 +1037,91 @@ targeted-device: AFS-67890
 ```
 
 With only one device connected the header is optional and AFCC routes to it
-implicitly.
+implicitly — but send it anyway. A client that always sets `targeted-device`
+keeps working unmodified the moment the user plugs in a second AudioFuse
+mid-session; one that omits it silently starts talking to "the first listed
+device," which may quietly change identity.
+
+## Client design notes
+
+Patterns worth following when building a client, drawn from the official
+docs:
+
+- **Read before writing a relative change.** The API has no "increment by"
+  semantics. For a "+1 dB" / "turn it down a bit" control: `GET` the current
+  value, compute the new absolute value, then `PUT`/`POST` it. Don't assume
+  you know the current value from a prior write — another client or a
+  hardware knob may have changed it since.
+- **Coalesce scene/snapshot recalls into one `POST` per parent resource.**
+  e.g. `POST /input/analog {"1": {...}, "2": {...}}` and
+  `POST /monitoring {"volume": ..., "dim": ..., "mono": ...}` instead of one
+  request per field — fewer round trips, less audible glitching during
+  recall.
+- **Subscribe to anything you display.** A value only `GET` once will drift
+  from reality the moment Control Center, another client, or a physical
+  button on the device changes it. Subscribe via `POST /update` for any
+  value shown in a UI (LED, meter, toggle state).
+- **Treat `200 Request ignored` as success**, not an error — it's normal for
+  redundant writes during snapshot recall (e.g. muting something already
+  muted).
+- **Derive your endpoint surface from `/devices` at runtime**, not from a
+  hardcoded device assumption. Hardcoding 16Rig-only endpoints (presets,
+  immersive controls) into a client also used with a Studio causes
+  `404 Not Available` and a confused user.
+- **There is no input/channel mute.** `mute` only exists on `/monitoring`
+  (the master output) and `/monitoring/phones/:index`. To fake a per-input
+  "mute" for a live-production mute button, drop that input's `gain` to a
+  floor value (e.g. `-60.0`) and restore the working value to "unmute" —
+  there's no dedicated kill switch on an input itself.
+- **There is no `talkback` endpoint.** Implement it as a DAW-side bus or a
+  temporary gain change on a talkback mic input driven by your controller.
+- **On-device presets (`/preset`, 16Rig only) are a different tool than
+  client-side snapshots.** They're few (8 slots), coarse, and capture full
+  device state including routing. For per-app scene recall (e.g. "synth jam"
+  vs "guitar tracking" configs), store your own JSON snapshots client-side
+  and apply them via `POST`; reserve `/preset` for state you want recallable
+  from the hardware itself, independent of any client being open.
+- **For AI-agent / LLM-driven control**, two tools are enough: `get(path)`
+  and `set(path, body, method='PUT')`. Bootstrap the agent's context with
+  `GET /devices`, `GET /clock/sample_rate_options`, `GET
+  /clock/source_options`, and the device-availability matrix from the
+  official endpoint reference, so it knows what values and endpoints are
+  legal for the connected model before it ever writes. Clamp agent-driven
+  volume changes to a safe range, subscribe to whatever it's controlling so
+  its model of the state stays in sync with changes made outside the agent,
+  and gate anything destructive (`POST /preset {"slot": N, "saved": true}`
+  overwrites that slot) behind explicit confirmation.
+- **Realistic numeric defaults from the reference recipes**, worth reusing
+  rather than inventing your own: a gain floor of `-60.0` dB as a per-input
+  "mute," a `-12.0` to `60.0` dB clamp range for input-gain nudges, `-3.0`
+  dB as a default "turn it down a bit" step, and `-18.0` dB as a typical
+  reference-level calibration point.
 
 ## Open questions
 
-- Exact PUT routes and request bodies for `/preset` beyond the documented
-  `name`/`slot`/`saved` combination rules — `/preset/save_to` remains
-  unresolved.
-- Setter validation, numeric ranges, and error bodies beyond the documented
-  `400`/`403`/`404`/`405`/`429`/`500` categories.
-- Whether 48V availability changes with external power/device state.
-- Heartbeat interval on `/events`.
-- Capability differences across AudioFuse models other than 16Rig and Studio
-  (all other models are explicitly unsupported by the API).
+- `/preset/save_to`'s actual request body — not in the official reference,
+  and possibly superseded by the `{"slot": N, "saved": true}` idiom (or by
+  the Postman-only `{"store": {...}}` shape above).
+- Precise numeric ranges (e.g. exact gain min/max per input class) and the
+  complete enum-value sets per device/index for `source`, `mode`, and `pad`
+  — the general error taxonomy (`400`'s five sub-reasons, `403`'s three
+  reason phrases, the retry policy) is now documented; what's left is
+  per-endpoint range/enum data, which official guidance says to read from
+  each `*_options` endpoint at runtime rather than hardcode.
+- Exact firmware-level nuance of state-dependent rejections beyond the
+  documented "connector must be physically present" rule for 48V/pad/
+  phase_invert/inst (e.g. whether behavior differs across firmware
+  revisions).
+- Heartbeat interval on `/events` — the official docs don't document a
+  heartbeat mechanism at all, so this is unresolved by design, not an
+  omission on Arturia's part.
+- Capability differences across AudioFuse models other than 16Rig and
+  Studio — moot for the current API, since the official docs confirm every
+  other model is categorically unsupported (`403 Invalid Device`), not
+  merely "different."
 - Message format for AFCC's internal IPC/device-control path, needed for mixer
   level, mute, solo, pan, and balance controls absent from the HTTP plugin
-  entirely.
+  entirely — not covered by the official docs either, which document only
+  the same `/api/v1` surface reverse-engineered here.
+- The Postman-only `clock_source`/`preferred_clock`/`reference`/
+  `increment_by` shapes above — real legacy/future surface, or dead ends?
