@@ -1,12 +1,20 @@
 # Unofficial Arturia AudioFuse Control Center HTTP API
 
-This document describes the undocumented HTTP API shipped with Arturia
-AudioFuse Control Center (AFCC) 2.4.0.347. It is based on static analysis of
-`httpfuse.dll`, read-only runtime enumeration, and a small number of confirmed
-write tests with an AudioFuse Studio.
+This document describes the HTTP API shipped with Arturia AudioFuse Control
+Center (AFCC) 2.4.0.347. It is based on static analysis of `httpfuse.dll`,
+read-only runtime enumeration, and a small number of confirmed write tests
+with an AudioFuse Studio.
 
-The API is undocumented and may change without notice. Device capability varies
-by model, input/output index, power state, and possibly firmware.
+> Arturia publishes an official developer documentation set for this API
+> (v1.0.0) at
+> https://dl.arturia.net/products/audiofuse-studio/extra/Fuse_HTTP_API_1_0_0.zip
+> (mirrored locally in [`user documentation/`](./user%20documentation/)).
+> That set is canonical for behavior; this file adds statically-recovered
+> detail — the full route/method matrix and raw binary evidence — that the
+> official docs don't include.
+
+Device capability varies by model, input/output index, power state, and
+possibly firmware.
 
 ## Base URL
 
@@ -174,6 +182,14 @@ curl.exe -H "Content-Type: application/json" -d '{"source":"disabled"}' http://l
 | 429 | Device-backed requests were issued too quickly; retry after a delay. |
 | 500 | Handler failed unexpectedly. Observed for `GET /preset` and when a non-numeric string is captured as an `:index` value. |
 
+`403 Device Not Found` is reserved for "no AudioFuse connected at all"
+(including a `targeted-device` header naming a serial that no longer
+matches). An unsupported parameter/index on a device that *is* connected
+should return `404 Not Available` instead — some responses recorded in this
+document for unsupported params on the tested Studio used `403` where `404`
+was expected; treat `404 Not Available` as the correct behavior per the
+[error code reference](./user%20documentation/07-error-codes.md#403-device-not-found).
+
 `HEAD` is handled generically, but the server closes the response with the GET
 `Content-Length` and no body; some clients report this as a short transfer.
 
@@ -268,38 +284,38 @@ Each string in `devices` is the serial number of a connected AudioFuse device.
 The serial number is not exposed as a REST subresource:
 `GET /devices/<device-serial-number>` returned 404.
 
-### Update submission
-
-Static registration confirms:
+### Update submission and events
 
 ```text
-POST    /api/v1/update
-OPTIONS /api/v1/update
-```
-
-OPTIONS returned 200 and advertised `GET, POST, OPTIONS`, although no GET
-handler is registered and `GET /update` returned `404 Not Found`. The POST body
-schema and intended caller remain unknown, so it has not been invoked. The
-string `/update/endpoints` also occurs in the DLL, but it is not registered as
-an HTTP route; `GET /update/endpoints` returned `404 Not Found`.
-
-### Events
-
-```http
-GET /api/v1/events
+POST /api/v1/update              {"endpoints": ["/monitoring/mute", "/monitoring/volume"]}
+GET  /api/v1/update/endpoints
+GET  /api/v1/events
 Accept: text/event-stream
 ```
 
-Observed stream records:
+`/events` only pushes updates for endpoints in an active subscription set —
+a stream opened without first subscribing stays open but never emits
+anything beyond the heartbeat. Build the subscription with `POST /update`
+before opening `/events`; `GET /update/endpoints` lists what's currently
+subscribed. The subscription is stateful and tied to the AFCC process (not
+the TCP connection), and expires after ~50s of inactivity, so refresh it
+(re-POST the same or a superset list) every 30–45s.
+
+Once subscribed, a change produces:
+
+```text
+event: update
+data: {"payload":[{"key":"/monitoring/mute","value":true}]}
+```
+
+`payload` is always an array of `{key, value}` pairs; `key` is the canonical
+path without the `/api/v1` prefix. With nothing subscribed, the stream only
+shows the heartbeat:
 
 ```text
 event: update
 : heartbeat
 ```
-
-No `data:` payload has been observed. The likely client behavior is to treat an
-`update` event as invalidation and re-fetch state; this still needs confirmation
-from the event handler.
 
 ## Clock
 
@@ -760,13 +776,34 @@ through the stock HTTP API. AFCC performs them through its separate internal
 IPC/device-control path; reverse-engineering that transport is a distinct open
 task.
 
+## Multi-device targeting
+
+A single AFCC instance manages every connected AudioFuse, so there is one
+HTTP API regardless of how many devices are plugged in. When more than one
+AudioFuse is connected, every parameter endpoint — everything except
+`/version`, `/devices`, `/events`, `/update`, `/update/endpoints` — must
+carry a `targeted-device` header naming the device serial (from
+`GET /devices`):
+
+```http
+GET /api/v1/monitoring/volume
+targeted-device: AFS-67890
+```
+
+With only one device connected the header is optional and AFCC routes to it
+implicitly.
+
 ## Open questions
 
-- Exact PUT routes and request bodies, especially preset operations.
-- Setter validation, numeric ranges, and error bodies.
+- Exact PUT routes and request bodies for `/preset` beyond the documented
+  `name`/`slot`/`saved` combination rules — `/preset/save_to` remains
+  unresolved.
+- Setter validation, numeric ranges, and error bodies beyond the documented
+  `400`/`403`/`404`/`405`/`429`/`500` categories.
 - Whether 48V availability changes with external power/device state.
-- Exact SSE update semantics and heartbeat interval.
-- Authentication, binding/interface exposure, and cross-origin security model.
-- Capability differences across other AudioFuse models.
+- Heartbeat interval on `/events`.
+- Capability differences across AudioFuse models other than 16Rig and Studio
+  (all other models are explicitly unsupported by the API).
 - Message format for AFCC's internal IPC/device-control path, needed for mixer
-  level, mute, solo, pan, and balance controls absent from the HTTP plugin.
+  level, mute, solo, pan, and balance controls absent from the HTTP plugin
+  entirely.
